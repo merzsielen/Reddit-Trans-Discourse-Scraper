@@ -18,15 +18,18 @@ term_list_path = os.path.dirname(__file__) + "/../settings/term_list"
 
 output_path = os.path.dirname(__file__) + "/../output/flagged.txt"
 
-total_post_limit = 80
+posts_per_minute = 80
+posts_per_subreddit = 200
+subreddits_per_minute = posts_per_subreddit / posts_per_minute
 
-cooldown = 72
+desired_entries = 10000
 
 ###################################################################################################
 # Classes                                                                                         #
 ###################################################################################################
 
 class Submission:
+	id = ""
 	author = ""
 	title = ""
 	body = ""
@@ -34,7 +37,8 @@ class Submission:
 	url = ""
 	label = 0
 	
-	def __init__(self, author, title, body, subreddit, url):
+	def __init__(self, id, author, title, body, subreddit, url):
+		self.id = id
 		self.author = author
 		self.title = title
 		self.body = body
@@ -42,17 +46,30 @@ class Submission:
 		self.url = url
 
 class Comment:
+	id = ""
 	author = ""
 	body = ""
 	subreddit = ""
 	url = ""
 	label = 0
+
+	parent_id = ""
+	parent_author = ""
+	parent_body = ""
+	parent_url = ""
+	parent_label = 0
 	
-	def __init__(self, author, body, subreddit, url):
+	def __init__(self, id, author, body, subreddit, url, parent_id, parent_author, parent_body, parent_url):
+		self.id = id
 		self.author = author
 		self.body = body
 		self.subreddit = subreddit
 		self.url = url
+		
+		self.parent_id = parent_id
+		self.parent_author = parent_author
+		self.parent_body = parent_body
+		self.parent_url = parent_url
 
 ###################################################################################################
 # Functions                                                                                       #
@@ -63,64 +80,69 @@ def GetFile(path):
 		return open(path, "r").read()
 	return ""
 
-def Scrape(term_list, subreddit_list, reddit):
-	submissions = []
+def Scrape(term_list, subreddit_name, reddit):
 	comments = []
 
-	post_limit = round(total_post_limit / len(subreddit_list))
+	subreddit = reddit.subreddit(subreddit_name)
+	print("Searching in /r/" + subreddit_name)
 
 	##############################################################
-	# Loop Through Subreddits                                    #
+	# Loop Through Hot Submissions                               #
 	##############################################################
-	for subreddit_name in subreddit_list:
-		subreddit = reddit.subreddit(subreddit_name)
-		print("Searching in /r/" + subreddit_name)
-
+	for submission in subreddit.hot(limit=posts_per_subreddit):
+		
 		##############################################################
-		# Loop Through Hot Submissions                               #
+		# Loop Through Comments                                      #
 		##############################################################
-		for submission in subreddit.hot(limit=post_limit):
-			sub_text = submission.title.lower() + " :: " + submission.selftext.lower()
-			sub_tokens = word_tokenize(sub_text)
-				
-			s_found_terms = []
+		submission.comments.replace_more(limit=0)
+		for comment in submission.comments.list():
+			com_text = comment.body.lower()
+			com_tokens = word_tokenize(com_text)
 
-			for tok in sub_tokens:
+			c_found_terms = []
+					
+			for tok in com_tokens:
 				if (tok in term_list):
-					s_found_terms.append(tok)
+					c_found_terms.append(tok)
 
-			if (len(s_found_terms) > 0):
-				s = Submission(submission.author,
-				submission.title,
-				submission.selftext,
-				submission.subreddit.display_name,
-				submission.url)
-					
-				submissions.append(s)
+			if (len(c_found_terms) > 0):
+				# We need to find the parent and grab its info.
+				parent_id = comment.parent_id
+				p = [c for c in submission.comments.list() if (c.id == parent_id[3:])]
+				
+				ci = 0
+				ca = ""
+				cb = ""
+				cs = ""
+				cu = ""
 
-			##############################################################
-			# Loop Through Comments                                      #
-			##############################################################
-			submission.comments.replace_more(limit=0)
-			for comment in submission.comments.list():
-				com_text = comment.body.lower()
-				com_tokens = word_tokenize(com_text)
+				ci = comment.id
+				if (comment.author != None):
+					ca = comment.author.name
+				cb = comment.body
+				cs = submission.subreddit.display_name
+				cu = comment.permalink
 
-				c_found_terms = []
-					
-				for tok in com_tokens:
-					if (tok in term_list):
-						c_found_terms.append(tok)
+				pi = 0
+				pa = ""
+				pb = ""
+				pu = ""
 
-				if (len(c_found_terms) > 0):
-					c = Comment(comment.author,
-					comment.body,
-					submission.subreddit.display_name,
-					comment.permalink)
-					
-					comments.append(c)
+				if (len(p) > 0):
+						pi = p[0].id
+						# It isn't entirely clear to me why this is coming back
+						# as a NoneType in rare circumstances.
+						if (p[0].author != None):
+							pa = p[0].author.name
+						pb = p[0].body
+						pu = p[0].permalink
 
-	return submissions, comments
+				c = Comment(ci, ca, cb, cs, cu,
+				pi, pa, pb, pu)
+
+				comments.append(c)
+
+	return comments
 
 ###################################################################################################
 # Main                                                                                            #
@@ -137,64 +159,28 @@ def main():
 					  client_secret=GetFile(client_secret_path),
 					  user_agent=GetFile(user_agent_path))
 	
-	flagged_submissions = []
+	current_subreddit = 0
 	flagged_comments = []
-
-	# tokenizer = AutoTokenizer.from_pretrained("Hate-speech-CNERG/dehatebert-mono-english")
-	# model = AutoModelForSequenceClassification.from_pretrained("Hate-speech-CNERG/dehatebert-mono-english")
-
-	# labels = ["Neutral", "Hateful"]
 
 	##############################################################
 	# Main Loop                                                  #
 	##############################################################
 	while(True):
 		t0 = time.monotonic()
-		print("Waking up!")
-		print()
 
 		##############################################################
 		# Scrape                                                     #
 		##############################################################
-		new_subs, new_coms = Scrape(term_list, subreddit_list, reddit)
+		sub_name = subreddit_list[current_subreddit]
+		new_coms = Scrape(term_list, sub_name, reddit)
 
 		##############################################################
-		# Loop Over New Submissions & Comments                       #
+		# Loop Over New Comments                                     #
 		##############################################################
-		old_subs = flagged_submissions
 		old_coms = flagged_comments
 
 		print("-------------------------------------------------------------")
-		print("Submissions")
-		print("-------------------------------------------------------------")
-		for n in new_subs:
-			found = False
-			for o in old_subs:
-				if (n.url == o.url):
-					found = True
-			if (not found):
-				
-				# inputs = tokenizer(n.body, truncation=True, return_tensors="pt")
-
-				# with torch.no_grad():
-				# 	logits = model(**inputs).logits
-
-				# n.label = logits.argmax().item()
-
-				flagged_submissions.append(n)
-
-				print()
-				print("-------------------------------------------------------------")
-				print(n.author)
-				print(n.title)
-				# print(n.subreddit)
-				print(n.url)
-				# print(labels[n.label])
-				print("-------------------------------------------------------------")
-				print()
-
-		print("-------------------------------------------------------------")
-		print("Comments")
+		print("New Comments")
 		print("-------------------------------------------------------------")
 		for n in new_coms:
 			found = False
@@ -203,13 +189,6 @@ def main():
 					found = True
 			if (not found):
 
-				# inputs = tokenizer(n.body, truncation=True, return_tensors="pt")
-
-				# with torch.no_grad():
-				# 	logits = model(**inputs).logits
-
-				# n.label = logits.argmax().item()
-				
 				flagged_comments.append(n)
 
 				print()
@@ -219,40 +198,39 @@ def main():
 				# print(n.subreddit)
 				print(n.url)
 				# print(labels[n.label])
+				if (n.parent_id != 0):
+					print("-----------------------------")
+					print("Parent:")
+					print(n.parent_author)
+					print(n.parent_body)
+					print("-----------------------------")
 				print("-------------------------------------------------------------")
 				print()
 
-		print("Sleeping...")
-		t1 = time.monotonic()
-		time.sleep(max(1, cooldown - (t1 - t0)))
-
-		if (len(flagged_submissions) + len(flagged_comments) > 1000):
+		print("Entries found: " + str(len(flagged_comments)))
+		if (len(flagged_comments) >= desired_entries):
 			break
 
-	output = ""
+		# Get next subreddit.
+		current_subreddit = (current_subreddit + 1) % len(subreddit_list)
 
-	output += "##############################################################" + "\n"
-	output += "# Submissions                                                #" + "\n"
-	output += "##############################################################" + "\n"
-	
-	for n in flagged_submissions:
-		output += "Title: " + n.title
-		output += "Author: /u/" + n.author
-		output += "Text: " + n.body
-		output += "Subreddit: /r/" + n.subreddit
-		output += "URL:" + n.url
+		t1 = time.monotonic()
+		time.sleep(max(1, (float(subreddits_per_minute * 60) - (t1 - t0))))
+
+	output = ""
 
 	output += "##############################################################" + "\n"
 	output += "# Comments                                                   #" + "\n"
 	output += "##############################################################" + "\n"
 	
 	for n in flagged_comments:
-		output += "Author: /u/" + n.author
-		output += "Text: " + n.body
-		output += "Subreddit: /r/" + n.subreddit
-		output += "URL:" + n.url
+		output += "Author: /u/" + n.author + "\n"
+		output += "Text: " + n.body + "\n"
+		output += "Subreddit: /r/" + n.subreddit + "\n"
+		output += "URL:" + n.url + "\n"
+		output += "##############################################################" + "\n"
 
-	file = open(output_path, "a")
+	file = open(output_path, 'w', encoding='utf8')
 	file.write(output)
 	file.close()
 
